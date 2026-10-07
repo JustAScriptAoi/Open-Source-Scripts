@@ -1,0 +1,356 @@
+if getgenv().GG_Unload then
+    pcall(getgenv().GG_Unload)
+    getgenv().GG_Unload = nil
+end
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService       = game:GetService("HttpService")
+local LocalPlayer       = Players.LocalPlayer
+local myId              = LocalPlayer.UserId
+
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/ObsidianUltra/main/Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/ObsidianUltra/main/addons/ThemeManager.lua"))()
+ThemeManager:SetLibrary(Library)
+
+local ServicesFolder = ReplicatedStorage.Packages._Index["sleitnick_knit@1.6.0"].knit.Services
+local function RF(service, name)
+    local s = ServicesFolder:FindFirstChild(service); if not s then return nil end
+    local f = s:FindFirstChild("RF"); if not f then return nil end
+    return f:FindFirstChild(name)
+end
+local function RE(service, name)
+    local s = ServicesFolder:FindFirstChild(service); if not s then return nil end
+    local f = s:FindFirstChild("RE"); if not f then return nil end
+    return f:FindFirstChild(name)
+end
+
+local rRequestPurchase = RF("SeedConveyorService", "RequestPurchase")
+local rToggleEquip     = RE("ToolService",         "ToggleEquip")
+local rStartRound      = RF("PlantRoundService",   "StartRound")
+local rStopPlant       = RF("PlantRoundService",   "StopPlant")
+local rCollectDead     = RF("PlantRoundService",   "CollectDeadTree")
+local rGetActiveRounds = RF("PlantRoundService",   "GetActiveRounds")
+local rSellAll         = RF("SellStandService",    "SellAll")
+
+local reRoundStarted   = RE("PlantRoundService",   "RoundStartedAll")
+local rePlantStopped   = RE("PlantRoundService",   "PlantStoppedAll")
+local reCrashed        = RE("PlantRoundService",   "CrashedAll")
+local reRoundReset     = RE("PlantRoundService",   "RoundResetAll")
+
+local DataClient
+pcall(function()
+    DataClient = require(ReplicatedStorage.Client.Controllers.DataClient)
+end)
+local function getData() return DataClient and DataClient.currentData end
+local function getCoins()
+    local d = getData()
+    if d and d.Currency then return d.Currency.COINS or 0 end
+    return 0
+end
+
+local SeedCosts = {}
+pcall(function()
+    local cfg = HttpService:JSONDecode(ReplicatedStorage.RemoteConfig.Value)
+    for name, info in pairs(cfg.seeds or {}) do
+        SeedCosts[name] = tonumber(info.plantCost) or math.huge
+    end
+end)
+if not next(SeedCosts) then SeedCosts.Oak = 0 end
+
+local seedList = {}
+for name in pairs(SeedCosts) do table.insert(seedList, name) end
+table.sort(seedList, function(a, b) return (SeedCosts[a] or 0) < (SeedCosts[b] or 0) end)
+
+local flags = { buy = false, plant = false, harvest = false, sell = false, collectDead = true }
+local selectedSeeds = { Oak = true }
+local plantSeed  = "Oak"
+local targetMult = 2.0
+local fertilizer = "None"
+
+local round = { active = false, startTime = nil, id = nil, crashed = false }
+local planting = false
+local running  = true
+local conns    = {}
+
+local function notify(title, desc, t)
+    pcall(function() Library:Notify({ Title = title, Description = desc, Time = t or 3 }) end)
+end
+
+local function computeMult()
+    if not round.startTime then return 0 end
+    local dt = workspace:GetServerTimeNow() - round.startTime
+    return math.max(0, math.floor((math.exp(0.28 * dt) - 1) * 100) / 100)
+end
+local function syncRound()
+    if not rGetActiveRounds then return false end
+    local ok, rounds = pcall(function() return rGetActiveRounds:InvokeServer() end)
+    if not ok or type(rounds) ~= "table" then return false end
+    for _, r in ipairs(rounds) do
+        if r.userId == myId and not r.crashed and not r.stopped then
+            round.active    = true
+            round.startTime = r.startTime
+            round.id        = r.roundId
+            return true
+        end
+    end
+    round.active    = false
+    round.startTime = nil
+    return false
+end
+
+if reRoundStarted then
+    table.insert(conns, reRoundStarted.OnClientEvent:Connect(function(uid)
+        if uid == myId then
+            round.active  = true
+            round.crashed = false
+            task.spawn(syncRound)
+        end
+    end))
+end
+if rePlantStopped then
+    table.insert(conns, rePlantStopped.OnClientEvent:Connect(function(uid)
+        if uid == myId then round.active = false; round.startTime = nil end
+    end))
+end
+if reCrashed then
+    table.insert(conns, reCrashed.OnClientEvent:Connect(function(uid)
+        if uid == myId then round.active = false; round.startTime = nil; round.crashed = true end
+    end))
+end
+if reRoundReset then
+    table.insert(conns, reRoundReset.OnClientEvent:Connect(function(uid)
+        if uid == myId then round.active = false; round.startTime = nil end
+    end))
+end
+
+local function findEquippedSeed()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, t in ipairs(char:GetChildren()) do
+        if t:IsA("Tool") and t:GetAttribute("IsSeed") then return t end
+    end
+    return nil
+end
+
+local function waitEquipped()
+    for _ = 1, 20 do
+        task.wait(0.05)
+        local e = findEquippedSeed()
+        if e then return e:GetAttribute("SeedType") end
+    end
+    return nil
+end
+
+local function equipSeed(wantType)
+    local eq = findEquippedSeed()
+    if eq then return eq:GetAttribute("SeedType") end
+    local d = getData()
+    if not d or not d.Inventory or not rToggleEquip then return nil end
+
+    local hb = d.Inventory.Hotbar or {}
+    for i = 1, 10 do
+        local item = hb[i]
+        if type(item) == "table" and item.itemType == "Seed"
+           and (wantType == "Any" or item.seedType == wantType) then
+            rToggleEquip:FireServer(true, i)
+            return waitEquipped()
+        end
+    end
+
+    local st = d.Inventory.Storage or {}
+    for i, item in pairs(st) do
+        if type(item) == "table" and item.itemType == "Seed"
+           and (wantType == "Any" or item.seedType == wantType) then
+            rToggleEquip:FireServer(false, i)
+            return waitEquipped()
+        end
+    end
+    return nil
+end
+
+task.spawn(function()
+    syncRound()
+    while running do
+        task.wait(0.08)
+        if round.active then
+            if not round.startTime then syncRound() end
+            if flags.harvest and round.startTime and computeMult() >= targetMult then
+                pcall(function() rStopPlant:InvokeServer() end)
+                round.active = false
+                round.startTime = nil
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while running do
+        task.wait(0.25)
+        if not flags.plant or round.active or planting then continue end
+        planting = true
+        if flags.collectDead and round.crashed then
+            pcall(function() rCollectDead:InvokeServer() end)
+            round.crashed = false
+            task.wait(0.2)
+        end
+        local seedType = equipSeed(plantSeed)
+        if seedType then
+            local ok = pcall(function() rStartRound:InvokeServer(seedType, fertilizer) end)
+            if ok then
+                round.active = true
+                task.wait(0.3)
+                syncRound()
+            end
+        end
+        planting = false
+    end
+end)
+
+task.spawn(function()
+    while running do
+        task.wait(0.8)
+        if not flags.buy or not rRequestPurchase then continue end
+        local field = workspace:FindFirstChild("BigField")
+        local conv  = field and field:FindFirstChild("ConveyorSeeds")
+        if not conv then continue end
+        for _, h in ipairs(conv:GetChildren()) do
+            if not (running and flags.buy) then break end
+            local sid   = h:GetAttribute("SpawnId")
+            local stype = h:GetAttribute("SeedType")
+            if sid and stype and selectedSeeds[stype] then
+                if getCoins() >= (SeedCosts[stype] or math.huge) then
+                    pcall(function() rRequestPurchase:InvokeServer(sid) end)
+                    task.wait(0.15)
+                end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while running do
+        task.wait(3)
+        if flags.sell and rSellAll then
+            pcall(function() rSellAll:InvokeServer() end)
+        end
+    end
+end)
+
+local Window = Library:CreateWindow({
+    Title  = "Greedy Growers",
+    Footer = "made by 2zvh :3",
+    Icon   = "sprout",
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+})
+
+local Tabs = {
+    Farm     = Window:AddTab("Farm", "sprout"),
+    Settings = Window:AddTab("Settings", "settings"),
+}
+
+local PlantBox = Tabs.Farm:AddLeftGroupbox("Auto Plant / Harvest", "sprout")
+
+PlantBox:AddDropdown("GG_PlantSeed", {
+    Text = "Seed to plant",
+    Values = seedList,
+    Default = "Oak",
+    Multi = false,
+    Callback = function(v) plantSeed = v end,
+})
+PlantBox:AddToggle("GG_AutoPlant", {
+    Text = "Auto Plant",
+    Default = false,
+    Callback = function(v) flags.plant = v end,
+})
+PlantBox:AddToggle("GG_AutoHarvest", {
+    Text = "Auto Harvest (before the lightning)",
+    Default = false,
+    Callback = function(v) flags.harvest = v end,
+})
+PlantBox:AddSlider("GG_TargetMult", {
+    Text = "Harvest Multiplier",
+    Default = 2,
+    Min = 1.1,
+    Max = 10,
+    Rounding = 2,
+    Suffix = "x",
+    Callback = function(v) targetMult = v end,
+})
+PlantBox:AddToggle("GG_CollectDead", {
+    Text = "Collect Dead Tree (after the lightning)",
+    Default = true,
+    Callback = function(v) flags.collectDead = v end,
+})
+local statusLbl = PlantBox:AddLabel("Estado: idle", true)
+PlantBox:AddLabel("Low multiplier = more safe against the lightning", true)
+
+local BuyBox = Tabs.Farm:AddRightGroupbox("Auto Buy", "shopping-cart")
+BuyBox:AddDropdown("GG_BuySeeds", {
+    Text = "Seeds to buy",
+    Values = seedList,
+    Default = { Oak = true },
+    Multi = true,
+    Callback = function(v)
+        selectedSeeds = {}
+        for name, on in pairs(v) do if on then selectedSeeds[name] = true end end
+    end,
+})
+BuyBox:AddToggle("GG_AutoBuy", {
+    Text = "Auto Buy (from the river)",
+    Default = false,
+    Callback = function(v) flags.buy = v end,
+})
+BuyBox:AddLabel("Only buy what you can afford", true)
+
+local SellBox = Tabs.Farm:AddRightGroupbox("Auto Sell", "dollar-sign")
+SellBox:AddToggle("GG_AutoSell", {
+    Text = "Auto Sell (all the trees)",
+    Default = false,
+    Tooltip = "Sell EVERY tree in your inventory every 3s",
+    Callback = function(v) flags.sell = v end,
+})
+SellBox:AddButton({
+    Text = "Sell All Now",
+    Func = function()
+        if rSellAll then pcall(function() rSellAll:InvokeServer() end) end
+    end,
+})
+
+pcall(function() ThemeManager:ApplyToTab(Tabs.Settings, "palette") end)
+
+task.spawn(function()
+    while running do
+        task.wait(0.15)
+        pcall(function()
+            statusLbl:SetText(string.format(
+                "Status: %s  |  Mult: %.2fx  |  Coins: %s",
+                round.active and "creciendo" or "idle",
+                computeMult(),
+                tostring(getCoins())
+            ))
+        end)
+    end
+end)
+
+local function cleanup()
+    running = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+end
+
+getgenv().GG_Unload = function()
+    cleanup()
+    pcall(function() Library:Unload() end)
+    getgenv().GG_Unload = nil
+end
+
+pcall(function()
+    Library:OnUnload(function()
+        cleanup()
+        getgenv().GG_Unload = nil
+    end)
+end)
+
+notify("Greedy Growers", "Auto Farm loaded :3", 4)
