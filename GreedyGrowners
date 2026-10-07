@@ -240,7 +240,7 @@ end)
 
 local Window = Library:CreateWindow({
     Title  = "Greedy Growers",
-    Footer = "made by 2zvh :3",
+    Footer = "made by zallvfly",
     Icon   = "sprout",
     NotifySide = "Right",
     ShowCustomCursor = true,
